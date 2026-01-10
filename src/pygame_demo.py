@@ -1,10 +1,10 @@
 """
-Pygame evacuation ABM with mouse UI (rebuilt from notes):
- - Masks are downsampled to 200x200 for computation, rendering scaled to full view.
- - River blocked; mountains passable with slowdown.
- - Fixed shelters from mask centroids; merged by 4-neighbor.
- - Flood surges every flood_interval (uses flood_time slider), repeats until flood_steps reached; runs alongside agent movement.
- - UI: Start/Pause, Reset Agents (resets flood), Instant Run, Flood toggle; sliders for population, clusters, sigma, min dist, deadline, dt, speeds, slow share, flood interval, flood steps.
+Pygame Evac Demo with Terrain/Flood (class-based)
+- Masks downsampled to 200x200 for computation; render scaled to 700x700
+- River impassable; mountain passable with slowdown; shelters fixed from masks
+- Flood surges every interval (flood_interval) until flood_steps; agents keep moving
+- UI (mouse): Start/Pause, Reset Agents (resets flood+agents), Instant Run, Flood toggle, Regenerate
+- Sliders: Population, Deadline, dt, Adult speed, Slow speed, Slow share, Flood interval, Flood steps
 """
 
 from __future__ import annotations
@@ -21,9 +21,19 @@ import pygame
 from PIL import Image
 
 WORLD_SIZE = 1000
-WIN_W, WIN_H = 1100, 820
-VIEW_SIZE = 800
-TARGET_GRID = 200  # computation grid
+VIEW_SIZE = 700
+WIN_W, WIN_H = 1040, 760
+TARGET_GRID = 200
+
+COLOR_BG = (245, 245, 245)
+COLOR_CANVAS = (230, 230, 230)
+COLOR_SHELTER = (44, 160, 44)
+COLOR_AGENT = (119, 119, 119)
+COLOR_ARRIVED = (0, 170, 0)
+COLOR_FAILED = (200, 50, 50)
+COLOR_MOUNTAIN = (80, 140, 80)
+COLOR_RIVER = (60, 150, 220)
+
 MOUNTAIN_SLOW = 0.45
 
 
@@ -84,6 +94,8 @@ def components(walkable: np.ndarray) -> np.ndarray:
 
 
 def merge_shelters(mask: np.ndarray, block: np.ndarray) -> List[Tuple[float, float]]:
+    if mask is None:
+        return []
     H, W = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
     dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
@@ -139,21 +151,22 @@ def mask_to_surface(mask: np.ndarray, color: Tuple[int, int, int], alpha: int = 
     return pygame.transform.scale(surf, (scale, scale))
 
 
+def world_to_screen(x: float, y: float) -> Tuple[int, int]:
+    scale = VIEW_SIZE / WORLD_SIZE
+    return int(x * scale), int(y * scale)
+
+
 @dataclass
 class Params:
-    n_agents: int = 1000
-    clusters: int = 4
-    cluster_sigma: float = 90.0
-    cluster_min_dist: float = 80.0
-    deadline: float = 30.0
+    population: int = 1000
+    deadline: float = 200.0
     dt: float = 0.1
     adult_speed: float = 2.5
     slow_speed: float = 1.3
     slow_share: float = 0.35
     flood_enable: bool = True
-    flood_time: float = 0.5   # interval between surges (seconds)
-    flood_steps: int = 200
-    flood_interval: float = 0.5  # legacy/unused
+    flood_interval: float = 3.8
+    flood_steps: int = 48
 
 
 @dataclass
@@ -168,16 +181,17 @@ class Agent:
 
 
 class World:
-    def __init__(self, params: Params):
+    def __init__(self, params: Params, base: Path):
         self.params = params
+        self.base = base
         self._load_masks()
         self._init_world()
 
     def _load_masks(self):
-        base = Path(__file__).resolve().parent.parent
-        npz_path = base / "data/masks_1000_user_corrected.npz"
-        river_main = base / "data/main_river_mask_1000.npy"
-        shelter_ext = base / "data/shelter_mask_center_1000_v2.npy"
+        data_dir = self.base / "data"
+        npz_path = data_dir / "masks_1000_with_main_river.npz"
+        river_main = data_dir / "main_river_mask_1000.npy"
+        shelter_ext = data_dir / "shelter_mask_center_1000_v2.npy"
         masks: Dict[str, np.ndarray] = {}
         if npz_path.exists():
             z = np.load(npz_path)
@@ -188,26 +202,26 @@ class World:
         if shelter_ext.exists():
             masks["shelter_mask_center_merged"] = np.load(shelter_ext).astype(bool)
 
-        river = masks.get("river_mask", np.zeros((WORLD_SIZE, WORLD_SIZE), dtype=bool))
+        river = masks.get("main_river_mask", masks.get("river_mask", np.zeros((WORLD_SIZE, WORLD_SIZE), dtype=bool)))
         mountain = masks.get("mountain_mask_corrected", masks.get("mountain_mask", np.zeros_like(river)))
         spawnable = masks.get("spawnable_no_river_mask", masks.get("spawnable_mask", np.ones_like(river)))
         pop_allowed = masks.get("population_allowed_mask", np.ones_like(river))
-        shelter_mask = masks.get("shelter_mask_center_merged", masks.get("shelter_mask_center_from_redcircles", None))
+        shelter_mask = masks.get("shelter_center_mask", masks.get("shelter_mask_center_merged", masks.get("shelter_mask_center_from_redcircles", None)))
 
-        # downsample
         self.river = downsample_mask(river)
         self.mountain = downsample_mask(mountain)
         self.spawnable = downsample_mask(spawnable)
         self.pop_allowed = downsample_mask(pop_allowed)
         self.shelter_mask = downsample_mask(shelter_mask) if shelter_mask is not None else None
 
-        # avoid spawn on river/mountain
         self.spawnable = self.spawnable & (~self.river) & (~self.mountain)
         self.pop_allowed = self.pop_allowed & (~self.river) & (~self.mountain)
 
     def _init_world(self):
         self.walkable = ~self.river
-        self.shelters = merge_shelters(self.shelter_mask, self.river) if self.shelter_mask is not None else []
+        self.shelters = merge_shelters(self.shelter_mask, self.river)
+        if not self.shelters:
+            self.shelters = [(random.uniform(20, WORLD_SIZE - 20), random.uniform(20, WORLD_SIZE - 20)) for _ in range(10)]
         self.comp = components(self.walkable)
         self.shelter_comp = [
             self.comp[int(s[1] / WORLD_SIZE * self.comp.shape[0]), int(s[0] / WORLD_SIZE * self.comp.shape[1])]
@@ -216,27 +230,8 @@ class World:
         self.flood_mask = self.river.copy()
         self.flood_steps_done = 0
         self.flood_accum = 0.0
-        self.flood_interval_current = max(0.01, self.params.flood_time)
-        self.agents: List[Agent] = self.sample_agents(self.params.n_agents)
+        self.agents: List[Agent] = self.sample_agents(self.params.population)
         self.time_s = 0.0
-
-    def reset(self, params: Params):
-        self.params = params
-        self._load_masks()
-        self._init_world()
-
-    def expand_river(self):
-        if self.flood_steps_done >= self.params.flood_steps:
-            return
-        self.flood_mask = dilate(self.flood_mask, 1)
-        self.walkable = ~self.flood_mask
-        self.comp = components(self.walkable)
-        self.shelter_comp = [
-            self.comp[int(s[1] / WORLD_SIZE * self.comp.shape[0]), int(s[0] / WORLD_SIZE * self.comp.shape[1])]
-            for s in self.shelters
-        ]
-        self.flood_steps_done += 1
-        self.flood_interval_current = max(0.01, self.params.flood_time)
 
     def sample_agents(self, n: int) -> List[Agent]:
         allowed = (self.spawnable & self.pop_allowed & self.walkable)
@@ -245,6 +240,7 @@ class World:
         random.shuffle(coords)
         agents: List[Agent] = []
         H, W = allowed.shape
+        allowed_comp = set(self.shelter_comp)
         while len(agents) < n:
             if coords:
                 i, j = coords.pop()
@@ -253,11 +249,12 @@ class World:
             else:
                 x = random.uniform(0, WORLD_SIZE)
                 y = random.uniform(0, WORLD_SIZE)
-            comp = self.comp[int(y / WORLD_SIZE * H), int(x / WORLD_SIZE * W)]
-            dmin = 1e9
-            tidx = -1
+            comp_id = self.comp[int(y / WORLD_SIZE * H), int(x / WORLD_SIZE * W)]
+            if comp_id not in allowed_comp:
+                continue
+            tidx, dmin = -1, 1e9
             for idx, (sx, sy) in enumerate(self.shelters):
-                if self.shelter_comp[idx] != comp:
+                if self.shelter_comp[idx] != comp_id:
                     continue
                 d = math.hypot(sx - x, sy - y)
                 if d < dmin:
@@ -271,36 +268,68 @@ class World:
             agents.append(Agent(x, y, v, tidx))
         return agents
 
-    def step_agent(self, a: Agent, dt: float):
-        if a.arrived or a.failed:
+    def reset_agents(self):
+        self.flood_mask = self.river.copy()
+        self.flood_steps_done = 0
+        self.flood_accum = 0.0
+        self.walkable = ~self.flood_mask
+        self.comp = components(self.walkable)
+        self.shelter_comp = [
+            self.comp[int(s[1] / WORLD_SIZE * self.comp.shape[0]), int(s[0] / WORLD_SIZE * self.comp.shape[1])]
+            for s in self.shelters
+        ]
+        self.agents = self.sample_agents(self.params.population)
+        self.time_s = 0.0
+
+    def expand_flood(self):
+        if self.flood_steps_done >= self.params.flood_steps:
             return
-        sx, sy = self.shelters[a.target]
-        dx = sx - a.x
-        dy = sy - a.y
-        dist = math.hypot(dx, dy)
-        if dist < 1e-6:
-            a.arrived = True
-            a.arrive_t += dt
-            return
-        speed = a.speed
-        i = int(a.y / WORLD_SIZE * self.mountain.shape[0])
-        j = int(a.x / WORLD_SIZE * self.mountain.shape[1])
-        if self.mountain[i, j]:
-            speed *= MOUNTAIN_SLOW
-        step = speed * dt
-        nx = a.x + dx / dist * step
-        ny = a.y + dy / dist * step
-        ri = int(ny / WORLD_SIZE * self.flood_mask.shape[0])
-        rj = int(nx / WORLD_SIZE * self.flood_mask.shape[1])
-        if self.flood_mask[ri, rj]:
-            a.failed = True
-            return
-        a.x, a.y = nx, ny
-        a.arrive_t += dt
-        if a.arrive_t >= self.params.deadline:
-            a.failed = True
-        if math.hypot(sx - a.x, sy - a.y) < 1.0:
-            a.arrived = True
+        new_mask = dilate(self.flood_mask, 1)
+        new_mask = new_mask & (~self.mountain)
+        self.flood_mask = new_mask
+        self.flood_steps_done += 1
+        self.walkable = ~self.flood_mask
+        self.comp = components(self.walkable)
+        self.shelter_comp = [
+            self.comp[int(s[1] / WORLD_SIZE * self.comp.shape[0]), int(s[0] / WORLD_SIZE * self.comp.shape[1])]
+            for s in self.shelters
+        ]
+
+    def step_agents(self, dt: float):
+        H, W = self.flood_mask.shape
+        for a in self.agents:
+            if a.arrived or a.failed:
+                continue
+            sx, sy = self.shelters[a.target]
+            dx = sx - a.x
+            dy = sy - a.y
+            dist = math.hypot(dx, dy)
+            if dist < 1e-6:
+                a.arrived = True
+                a.arrive_t = self.time_s
+                continue
+            speed = a.speed
+            mi = int(a.y / WORLD_SIZE * self.mountain.shape[0])
+            mj = int(a.x / WORLD_SIZE * self.mountain.shape[1])
+            if self.mountain[mi, mj]:
+                speed *= MOUNTAIN_SLOW
+            step = speed * dt
+            if step >= dist:
+                a.x, a.y = sx, sy
+                a.arrived = True
+                a.arrive_t = self.time_s + dist / speed
+            else:
+                a.x += dx / dist * step
+                a.y += dy / dist * step
+            ri = int(a.y / WORLD_SIZE * H)
+            rj = int(a.x / WORLD_SIZE * W)
+            if self.flood_mask[ri, rj]:
+                a.failed = True
+        self.time_s += dt
+        if self.time_s >= self.params.deadline:
+            for a in self.agents:
+                if not (a.arrived or a.failed):
+                    a.failed = True
 
     def stats(self):
         total = len(self.agents)
@@ -388,180 +417,162 @@ class Slider:
         return False
 
 
-def world_to_screen(x: float, y: float) -> Tuple[int, int]:
-    scale = VIEW_SIZE / WORLD_SIZE
-    return int(x * scale), int(y * scale)
+class App:
+    def __init__(self):
+        global FONT
+        pygame.init()
+        FONT = pygame.font.SysFont("Arial", 16)
+        self.screen = pygame.display.set_mode((WIN_W, WIN_H))
+        pygame.display.set_caption("Evac with Terrain/Flood")
+        self.clock = pygame.time.Clock()
+        self.base = Path(__file__).resolve().parent.parent
 
+        self.params = Params()
+        self.world = World(self.params, self.base)
 
-def main():
-    global FONT
-    pygame.init()
-    FONT = pygame.font.SysFont("Arial", 16)
-    screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption("Pygame Evac ABM (GUI)")
-    clock = pygame.time.Clock()
+        data_dir = self.base / "data"
+        self.bg = load_image(data_dir / "background.jpeg", VIEW_SIZE) or load_image(self.base / "background.jpeg", VIEW_SIZE)
+        if self.bg is None:
+            self.bg = load_image(data_dir / "image.png", VIEW_SIZE) or load_image(self.base / "image.png", VIEW_SIZE)
 
-    bg = load_image(Path(__file__).resolve().parent.parent / "image.png", VIEW_SIZE)
+        self.river_surf = self.build_river_surf()
+        self.mountain_surf = mask_to_surface(self.world.mountain, COLOR_MOUNTAIN, 90, VIEW_SIZE)
+        self.buttons: List[Button] = []
+        self.sliders: List[Slider] = []
+        self._setup_ui()
 
-    params = Params()
-    world = World(params)
-    river_surf = mask_to_surface(world.flood_mask, (60, 150, 220), 200, VIEW_SIZE)
-    mountain_surf = mask_to_surface(world.mountain, (80, 140, 80), 90, VIEW_SIZE)
+    def build_river_surf(self):
+        return mask_to_surface(self.world.flood_mask, COLOR_RIVER, 180, VIEW_SIZE)
 
-    running = False
+    def regenerate(self):
+        self.world = World(self.params, self.base)
+        self.river_surf = self.build_river_surf()
+        self.mountain_surf = mask_to_surface(self.world.mountain, COLOR_MOUNTAIN, 90, VIEW_SIZE)
+        self.buttons[0].active = False
 
-    buttons: List[Button] = []
-    sliders: List[Slider] = []
+    def reset_agents(self):
+        self.world.reset_agents()
+        self.river_surf = self.build_river_surf()
+        self.buttons[0].active = False
 
-    def regenerate():
-        nonlocal world, river_surf, mountain_surf, running
-        world = World(params)
-        river_surf = mask_to_surface(world.flood_mask, (60, 150, 220), 200, VIEW_SIZE)
-        mountain_surf = mask_to_surface(world.mountain, (80, 140, 80), 90, VIEW_SIZE)
-        running = False
-
-    def start_pause():
-        nonlocal running
-        running = not running
-
-    def reset_agents():
-        nonlocal world, running, river_surf
-        world.flood_mask = world.river.copy()
-        world.walkable = ~world.flood_mask
-        world.comp = components(world.walkable)
-        world.shelter_comp = [
-            world.comp[int(s[1] / WORLD_SIZE * world.comp.shape[0]), int(s[0] / WORLD_SIZE * world.comp.shape[1])]
-            for s in world.shelters
-        ]
-        world.flood_steps_done = 0
-        world.flood_accum = 0.0
-        world.flood_interval_current = max(0.01, params.flood_time)
-        world.agents = world.sample_agents(params.n_agents)
-        world.time_s = 0.0
-        river_surf = mask_to_surface(world.flood_mask, (60, 150, 220), 200, VIEW_SIZE)
-        running = False
-
-    def instant_run():
-        nonlocal world, river_surf
-        dt = params.dt
+    def instant_run(self):
+        dt = self.params.dt
         while True:
-            if params.flood_enable:
-                world.flood_accum += dt
+            if self.params.flood_enable and self.world.time_s < self.params.deadline:
+                self.world.flood_accum += dt
                 expand_limit = 200
                 count = 0
-                while world.flood_accum >= world.flood_interval_current and world.flood_steps_done < params.flood_steps and count < expand_limit:
-                    world.expand_river()
-                    world.flood_accum -= world.flood_interval_current
-                    river_surf = mask_to_surface(world.flood_mask, (60, 150, 220), 200, VIEW_SIZE)
+                while (
+                    self.world.flood_accum >= self.params.flood_interval
+                    and self.world.flood_steps_done < self.params.flood_steps
+                    and count < expand_limit
+                ):
+                    self.world.expand_flood()
+                    self.world.flood_accum -= self.params.flood_interval
+                    self.river_surf = self.build_river_surf()
                     count += 1
-            for a in world.agents:
-                world.step_agent(a, dt)
-            world.time_s += dt
-            if world.time_s >= params.deadline or all(a.arrived or a.failed for a in world.agents):
-                if world.time_s >= params.deadline:
-                    for a in world.agents:
-                        if not (a.arrived or a.failed):
-                            a.failed = True
+            self.world.step_agents(dt)
+            if self.world.time_s >= self.params.deadline or all(a.arrived or a.failed for a in self.world.agents):
                 break
+        self.river_surf = self.build_river_surf()
 
-    buttons.append(Button((840, 40, 220, 32), "Start / Pause", start_pause, toggle=True))
-    buttons.append(Button((840, 80, 220, 32), "Reset Agents", reset_agents))
-    buttons.append(Button((840, 120, 220, 32), "Instant Run", instant_run))
+    def _setup_ui(self):
+        self.buttons = [
+            Button((820, 30, 200, 32), "Start / Pause", lambda: None, toggle=True),
+            Button((820, 70, 200, 32), "Reset Agents", self.reset_agents),
+            Button((820, 110, 200, 32), "Instant Run", self.instant_run),
+            Button((820, 150, 200, 32), "Flood toggle", lambda: setattr(self.params, "flood_enable", not self.params.flood_enable), toggle=True),
+            Button((820, 190, 200, 32), "Regenerate", self.regenerate),
+        ]
+        self.sliders = [
+            Slider((820, 240, 200, 16), "Population", 100, 3000, 50, "population", "{:.0f}"),
+            Slider((820, 270, 200, 16), "Deadline T", 2, 200, 2, "deadline", "{:.0f}"),
+            Slider((820, 300, 200, 16), "dt", 0.02, 0.5, 0.01, "dt"),
+            Slider((820, 330, 200, 16), "Adult speed", 0.5, 10.0, 0.1, "adult_speed", "{:.1f}"),
+            Slider((820, 360, 200, 16), "Slow speed", 0.2, 5.0, 0.1, "slow_speed", "{:.1f}"),
+            Slider((820, 390, 200, 16), "Slow share", 0.0, 1.0, 0.05, "slow_share", "{:.2f}"),
+            Slider((820, 420, 200, 16), "Flood interval", 0.05, 5.0, 0.05, "flood_interval", "{:.2f}"),
+            Slider((820, 450, 200, 16), "Flood steps", 1, 200, 1, "flood_steps", "{:.0f}"),
+        ]
 
-    sliders.append(Slider((840, 210, 220, 16), "Population", 200, 3000, 50, "n_agents", "{:.0f}"))
-    sliders.append(Slider((840, 240, 220, 16), "Clusters", 1, 10, 1, "clusters", "{:.0f}"))
-    sliders.append(Slider((840, 270, 220, 16), "Cluster sigma", 20, 250, 5, "cluster_sigma"))
-    sliders.append(Slider((840, 300, 220, 16), "Cluster min dist", 20, 500, 10, "cluster_min_dist", "{:.0f}"))
-    sliders.append(Slider((840, 330, 220, 16), "Deadline T", 2, 120, 1, "deadline", "{:.0f}"))
-    sliders.append(Slider((840, 360, 220, 16), "dt", 0.02, 0.5, 0.01, "dt"))
-    sliders.append(Slider((840, 390, 220, 16), "Adult speed", 0.5, 5.0, 0.1, "adult_speed", "{:.1f}"))
-    sliders.append(Slider((840, 420, 220, 16), "Slow speed", 0.2, 3.0, 0.1, "slow_speed", "{:.1f}"))
-    sliders.append(Slider((840, 450, 220, 16), "Slow share", 0.0, 1.0, 0.05, "slow_share"))
-    sliders.append(Slider((840, 480, 220, 16), "Flood interval (s)", 0.05, 5.0, 0.05, "flood_time", "{:.2f}"))
-    sliders.append(Slider((840, 510, 220, 16), "Flood steps", 1, 200, 1, "flood_steps", "{:.0f}"))
-
-    flood_toggle = Button((840, 580, 220, 32), "Flood toggle", lambda: setattr(params, "flood_enable", not params.flood_enable), toggle=True)
-    buttons.append(flood_toggle)
-
-    def handle_ui_event(event):
-        nonlocal world, river_surf, mountain_surf, running
+    def handle_event(self, event) -> None:
         if event.type == pygame.MOUSEBUTTONDOWN:
-            for b in buttons:
+            for b in self.buttons:
                 if b.handle(event.pos):
-                    return True
-        for s in sliders:
-            if s.handle(event, params):
-                return True
-        return False
+                    return
+        for s in self.sliders:
+            if s.handle(event, self.params):
+                return
 
-    while True:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit(0)
-            if handle_ui_event(event):
-                if event.type == pygame.MOUSEBUTTONUP:
-                    regenerate()
-
+    def update(self):
+        running = self.buttons[0].active
         if running:
-            if params.flood_enable:
-                world.flood_accum += params.dt
+            if self.params.flood_enable and self.world.time_s < self.params.deadline:
+                self.world.flood_accum += self.params.dt
                 expand_limit = 20
                 count = 0
-                while world.flood_accum >= world.flood_interval_current and world.flood_steps_done < params.flood_steps and count < expand_limit:
-                    world.expand_river()
-                    world.flood_accum -= world.flood_interval_current
-                    river_surf = mask_to_surface(world.flood_mask, (60, 150, 220), 200, VIEW_SIZE)
+                while (
+                    self.world.flood_accum >= self.params.flood_interval
+                    and self.world.flood_steps_done < self.params.flood_steps
+                    and count < expand_limit
+                ):
+                    self.world.expand_flood()
+                    self.world.flood_accum -= self.params.flood_interval
+                    self.river_surf = self.build_river_surf()
                     count += 1
-            for a in world.agents:
-                world.step_agent(a, params.dt)
-            world.time_s += params.dt
-            if world.time_s >= params.deadline:
-                for a in world.agents:
+            self.world.step_agents(self.params.dt)
+            if self.world.time_s >= self.params.deadline:
+                for a in self.world.agents:
                     if not (a.arrived or a.failed):
                         a.failed = True
-                running = False
+                self.buttons[0].active = False
 
-        screen.fill((245, 245, 245))
-        if bg:
-            screen.blit(bg, (20, 20))
+    def render(self):
+        self.screen.fill(COLOR_BG)
+        if self.bg:
+            self.screen.blit(self.bg, (20, 20))
         else:
-            pygame.draw.rect(screen, (230, 230, 230), (20, 20, VIEW_SIZE, VIEW_SIZE))
-        screen.blit(mountain_surf, (20, 20))
-        screen.blit(river_surf, (20, 20))
-
-        for sx, sy in world.shelters:
+            pygame.draw.rect(self.screen, COLOR_CANVAS, (20, 20, VIEW_SIZE, VIEW_SIZE))
+        self.screen.blit(self.mountain_surf, (20, 20))
+        self.screen.blit(self.river_surf, (20, 20))
+        for sx, sy in self.world.shelters:
             px, py = world_to_screen(sx, sy)
-            pygame.draw.rect(screen, (44, 160, 44), pygame.Rect(20 + px - 5, 20 + py - 5, 10, 10))
-        for a in world.agents:
+            pygame.draw.rect(self.screen, COLOR_SHELTER, pygame.Rect(20 + px - 6, 20 + py - 6, 12, 12))
+        for a in self.world.agents:
             px, py = world_to_screen(a.x, a.y)
-            color = (0, 160, 0) if a.arrived else (200, 50, 50) if a.failed else (90, 90, 90)
-            pygame.draw.circle(screen, color, (20 + px, 20 + py), 2)
+            color = COLOR_ARRIVED if a.arrived else COLOR_FAILED if a.failed else COLOR_AGENT
+            pygame.draw.circle(self.screen, color, (20 + px, 20 + py), 2)
+        pygame.draw.rect(self.screen, (255, 255, 255), (800, 0, WIN_W - 800, WIN_H))
+        for b in self.buttons:
+            b.draw(self.screen)
+        for s in self.sliders:
+            s.draw(self.screen, self.params)
 
-        pygame.draw.rect(screen, (255, 255, 255), (820, 0, WIN_W - 820, WIN_H))
-        for b in buttons:
-            b.draw(screen)
-        flood_toggle.active = params.flood_enable
-        for s in sliders:
-            s.draw(screen, params)
-
-        st = world.stats()
+        st = self.world.stats()
         info = [
-            f"Time: {world.time_s:.1f}s / T={params.deadline:.1f}s",
+            f"Time: {self.world.time_s:.1f}s / T={self.params.deadline:.0f}s",
             f"Arrived: {st['arrived']} ({st['arrived']/st['total']*100:4.1f}%)",
             f"Failed: {st['failed']} ({st['failed']/st['total']*100:4.1f}%)",
             f"Moving: {st['moving']}",
             f"Mean t: {st['mean_t']:.2f}  P90: {st['p90']:.2f}",
-            f"Flood: {world.flood_steps_done}/{params.flood_steps}",
-            f"Interval now: {world.flood_interval_current:.3f}s",
+            f"Flood: {self.world.flood_steps_done}/{self.params.flood_steps}",
         ]
-        for idx, line in enumerate(info):
+        for i, line in enumerate(info):
             txt = FONT.render(line, True, (20, 20, 20))
-            screen.blit(txt, (840, 630 + idx * 20))
-
+            self.screen.blit(txt, (820, 520 + i * 20))
         pygame.display.flip()
-        clock.tick(60)
+
+    def run(self):
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit(0)
+                self.handle_event(event)
+            self.update()
+            self.render()
+            self.clock.tick(60)
 
 
 if __name__ == "__main__":
-    main()
+    App().run()
