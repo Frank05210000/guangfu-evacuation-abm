@@ -13,5 +13,5 @@
 ```bash
 cd 基礎架構
 pip install pygame pillow numpy
-python src/pygame_demo.py
+python src/app.py
 ```

@@ -12,7 +12,11 @@
 ## 專案結構
 ```
 基礎架構/
-├── src/pygame_demo.py          # 主程式（類別化，滑鼠 UI）
+├── src/app.py                 # 主程式入口（類別化，滑鼠 UI）
+├── src/world.py               # 模擬核心（遮罩載入、洪水、代理人）
+├── src/utils.py               # 輔助函式（遮罩處理、繪圖轉換）
+├── src/ui.py                  # Button / Slider UI 元件
+├── src/config.py              # 常數與顏色設定
 ├── data/
 │   ├── masks_1000_with_main_river.npz  # river/mountain/spawnable/shelter 遮罩
 │   └── background.jpeg                 # 背景圖（可缺）
@@ -27,7 +31,7 @@
 ```bash
 cd 基礎架構
 pip install pygame pillow numpy
-python src/pygame_demo.py
+python src/app.py
 ```
 
 ## 介面與控制摘要
